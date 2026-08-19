@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  # Service 1: PostgreSQL Database Container
+  postgres_db:
+    image: postgres:16
+    container_name: de_postgres_container
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: de_database
+    ports:
+      - "5433:5432"  # Maps local port 5433 to container port 5432 so like we basiocally make a tunnel from windows to docker
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d de_database"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  
+  # Service 2: python script runner container
+  etl_pipeline:
+    build: .
+    container_name: de_python_pipeline
+    environment:
+      DB_HOST: postgres_db
+      DB_PORT: 5432
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      DB_NAME: de_database
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
