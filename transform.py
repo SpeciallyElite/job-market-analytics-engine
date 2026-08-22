@@ -8,7 +8,7 @@ def clean_job_data(raw_jobs):
 
     print("Cleaning and transforming data with Pandas...")
 
-    # converts the raw job dictionaries into a dataframe from
+    # converts the raw job dictionaries into a dataframe from raw_jobs
     df = pd.DataFrame(raw_jobs)
 
     selected_columns = ['company', 'position', 'location', 'tags', 'date']
