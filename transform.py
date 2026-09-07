@@ -1,83 +1,126 @@
+import os
+import json
+import logging
 import pandas as pd
-from extract import fetch_job_data
 
-def transform_data(raw_jobs):
-    if not raw_jobs:
-        print("No raw data provided to clean.")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("pipeline.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+RAW_DATA_PATH = "data/raw_jobs.json"
+
+def transform_data():
+    logger.info("Starting data transformation process...")
+
+    if not os.path.exists(RAW_DATA_PATH):
+        logger.error(f"Transformation failed: File {RAW_DATA_PATH} does not exist!")
+        raise FileNotFoundError(f"Missing raw data file at {RAW_DATA_PATH}")
+
+    with open(RAW_DATA_PATH, "r", encoding="utf-8") as f:
+        raw_data = json.load(f)
+
+    if not raw_data:
+        logger.warning("Raw data file is empty. Returning empty DataFrames.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    print("Cleaning and transforming data into Star Schema with Pandas...")
+    jobs_raw = raw_data[1:] if len(raw_data) > 1 and isinstance(raw_data[0], dict) and "legal" in raw_data[0] else raw_data
+    logger.info(f"Loaded {len(jobs_raw)} raw job payloads for parsing.")
 
-    # 1. Transform dim_companies
-    companies = []
-    for job in raw_jobs:
-        if isinstance(job, dict) and job.get("company"):
-            companies.append({
-                "company_name": job.get("company"),
-                "company_logo_url": job.get("company_logo")
+    companies_list = []
+    categories_set = set()
+    fact_jobs_list = []
+    skipped_count = 0
+
+    for idx, job in enumerate(jobs_raw):
+        try:
+            if not isinstance(job, dict):
+                logger.warning(f"Row #{idx}: Record is not a valid JSON dictionary. Skipping.")
+                skipped_count += 1
+                continue
+
+            company_name = job.get("company")
+            job_id = job.get("id")
+
+            if not company_name or not str(company_name).strip():
+                logger.warning(f"Row #{idx}: Missing company name. Skipping record.")
+                skipped_count += 1
+                continue
+
+            if not job_id:
+                logger.warning(f"Row #{idx}: Missing job ID for company '{company_name}'. Skipping record.")
+                skipped_count += 1
+                continue
+
+            companies_list.append({
+                "company_name": str(company_name).strip(),
+                "company_logo_url": str(job.get("company_logo", "")).strip()
             })
-    df_companies = (
-        pd.DataFrame(companies)
-        .drop_duplicates(subset=["company_name"])
-        .dropna(subset=["company_name"])
-    )
 
-    # 2. Transform dim_categories (Extracting & flattening RemoteOK tags)
-    categories = []
-    for job in raw_jobs:
-        if isinstance(job, dict) and job.get("tags"):
-            tags = job.get("tags")
+            tags = job.get("tags", [])
+            primary_tag = None
             if isinstance(tags, list):
                 for tag in tags:
-                    categories.append({
-                        "category_name": str(tag).strip().lower()
-                    })
-    df_categories = (
-        pd.DataFrame(categories)
-        .drop_duplicates(subset=["category_name"])
-        .dropna(subset=["category_name"])
-    )
+                    if tag and str(tag).strip():
+                        cleaned_tag = str(tag).strip().lower()
+                        categories_set.add(cleaned_tag)
+                        if not primary_tag:
+                            primary_tag = cleaned_tag  
 
-    # 3. Transform fct_job_postings
-    jobs = []
-    for job in raw_jobs:
-        if isinstance(job, dict) and job.get("id"):
-            # Select primary tag or default category
-            primary_tag = None
-            tags = job.get("tags")
-            if isinstance(tags, list) and len(tags) > 0:
-                primary_tag = str(tags[0]).strip().lower()
-
-            jobs.append({
-                "job_id": job.get("id"),
-                "company_name": job.get("company"),       # Temporary lookup key for load.py
-                "category_name": primary_tag,             # Temporary lookup key for load.py
-                "title": job.get("position"),
+            fact_jobs_list.append({
+                "job_id": job_id,
+                "company_name": str(company_name).strip(),
+                "category_name": primary_tag,
+                "title": str(job.get("position", "Unknown Position")).strip(),
                 "publication_date": job.get("date"),
-                "candidate_required_location": job.get("location"),
-                "url": job.get("url")
-                # "job_type": job.get("job_type", "Full Time"),
-                # "salary": str(job.get("salary")) if job.get("salary") else "Not Specified",
+                "candidate_required_location": str(job.get("location", "Remote")).strip(),
+                "url": str(job.get("url", "")).strip()
             })
 
-    df_jobs = pd.DataFrame(jobs).dropna(subset=["job_id", "title"])
+        except Exception as e:
+            logger.warning(f"Row #{idx}: Unexpected error parsing record (ID: {job.get('id', 'Unknown')}): {e}. Skipping.")
+            skipped_count += 1
+            continue
 
-    # Apply your Pandas cleaning logic!
-    if 'candidate_required_location' in df_jobs.columns:
-        df_jobs['candidate_required_location'] = (
-            df_jobs['candidate_required_location'].fillna('Remote').replace('', 'Remote')
-        )
+    df_companies = (
+        pd.DataFrame(companies_list)
+        .drop_duplicates(subset=["company_name"])
+        .dropna(subset=["company_name"])
+    ) if companies_list else pd.DataFrame()
 
-    if 'publication_date' in df_jobs.columns:
-        df_jobs['publication_date'] = pd.to_datetime(df_jobs['publication_date'], errors='coerce')
+    df_categories = (
+        pd.DataFrame([{"category_name": c} for c in categories_set])
+        .drop_duplicates(subset=["category_name"])
+        .dropna(subset=["category_name"])
+    ) if categories_set else pd.DataFrame()
 
-    print(f"Transformation complete! Cleaned {len(df_companies)} companies, {len(df_categories)} categories, and {len(df_jobs)} jobs.")
+    df_jobs = pd.DataFrame(fact_jobs_list) if fact_jobs_list else pd.DataFrame()
+
+    if not df_jobs.empty:
+        if 'candidate_required_location' in df_jobs.columns:
+            df_jobs['candidate_required_location'] = (
+                df_jobs['candidate_required_location'].fillna('Remote').replace('', 'Remote')
+            )
+
+        if 'publication_date' in df_jobs.columns:
+            df_jobs['publication_date'] = pd.to_datetime(df_jobs['publication_date'], errors='coerce')
+
+        df_jobs = df_jobs.dropna(subset=["job_id", "title"])
+
+    logger.info(
+        f"Transformation complete! Processed: {len(df_jobs)} valid jobs, "
+        f"{len(df_companies)} companies, {len(df_categories)} categories | Skipped: {skipped_count} bad rows."
+    )
 
     return df_companies, df_categories, df_jobs
 
 if __name__ == "__main__":
-    raw_data = fetch_job_data()
-    df_comp, df_cat, df_jobs = transform_data(raw_data)
-    
+    df_comp, df_cat, df_j = transform_data()
     print("\n--- FIRST 5 ROWS OF JOBS FACT TABLE ---")
-    print(df_jobs.head())
+    print(df_j.head())

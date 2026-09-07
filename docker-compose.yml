@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
     ports:
-      - "5433:5432"  # Maps local port 5433 to container port 5432 so like we basiocally make a tunnel from windows to docker
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -18,16 +18,15 @@ services:
       timeout: 5s
       retries: 5
   
-  # Service 2: python script runner container
   etl_pipeline:
     build: .
     container_name: de_python_pipeline
     environment:
-      DB_HOST: postgres_db
-      DB_PASSWORD: ${DB_PASSWORD}
       DB_USER: ${DB_USER}
-      DB_NAME: ${DB_NAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: postgres_db
       DB_PORT: ${DB_PORT}
+      DB_NAME: ${DB_NAME}
     depends_on:
       postgres_db:
         condition: service_healthy

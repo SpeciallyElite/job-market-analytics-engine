@@ -1,102 +1,126 @@
 import os
+import logging
 import pandas as pd
-from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-from transform import transform_data
+from sqlalchemy import create_engine, text
 from extract import fetch_job_data
+from transform import transform_data
 
-def load_data_to_postgres(df_companies, df_categories, df_jobs):
-    if df_companies.empty or df_jobs.empty:
-        print("DataFrames are empty. Nothing to load into database.")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("pipeline.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("load")
+
+load_dotenv(override=True)
+
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "rootpassword")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5433")
+DB_NAME = os.getenv("DB_NAME", "de_database")
+
+DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+def load_data():
+    logger.info("Running the extraction:")
+    fetch_job_data()
+
+    logger.info("Starting database load process...")
+    df_companies, df_categories, df_jobs = transform_data()
+
+    if df_jobs.empty:
+        logger.warning("No valid job data to load into PostgreSQL. Exiting load step.")
         return
 
-    load_dotenv()
+    try:
+        engine = create_engine(DB_URL)
+        
+        with engine.begin() as conn:
+            logger.info("Database connection established. Starting transaction...")
 
-    # Matching environment variables with local fallbacks
-    DB_HOST = os.getenv("DB_HOST", "localhost")
-    DB_PORT = os.getenv("DB_PORT", "5433")
-    DB_USER = os.getenv("DB_USER", "root")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "rootpassword")
-    DB_NAME = os.getenv("DB_NAME", "de_database")
+            logger.info(f"Upserting {len(df_companies)} companies into dim_companies...")
+            for _, row in df_companies.iterrows():
+                conn.execute(
+                    text("""
+                        INSERT INTO dim_companies (company_name, company_logo_url)
+                        VALUES (:company_name, :company_logo_url)
+                        ON CONFLICT (company_name) DO UPDATE
+                        SET company_logo_url = EXCLUDED.company_logo_url;
+                    """),
+                    {
+                        "company_name": row["company_name"],
+                        "company_logo_url": row["company_logo_url"]
+                    }
+                )
 
-    DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    
-    print("Connecting to PostgreSQL database...")
-    engine = create_engine(DATABASE_URL)
+            logger.info(f"Upserting {len(df_categories)} categories into dim_categories...")
+            for _, row in df_categories.iterrows():
+                conn.execute(
+                    text("""
+                        INSERT INTO dim_categories (category_name)
+                        VALUES (:category_name)
+                        ON CONFLICT (category_name) DO NOTHING;
+                    """),
+                    {"category_name": row["category_name"]}
+                )
 
-    with engine.begin() as conn:
-        # 1. Load dim_companies & capture company_id mapping
-        company_id_map = {}
-        print(f"Loading {len(df_companies)} companies into 'dim_companies'...")
-        for _, row in df_companies.iterrows():
-            result = conn.execute(
-                text("""
-                    INSERT INTO dim_companies (company_name, company_logo_url)
-                    VALUES (:name, :logo)
-                    ON CONFLICT (company_name) DO UPDATE
-                    SET company_logo_url = EXCLUDED.company_logo_url
-                    RETURNING company_id, company_name;
-                """),
-                {"name": row["company_name"], "logo": row["company_logo_url"]}
-            )
-            c_id, c_name = result.fetchone()
-            company_id_map[c_name] = c_id
+            logger.info("Fetching dimension IDs for fact table foreign key mappings...")
+            comp_map = pd.read_sql("SELECT company_id, company_name FROM dim_companies;", conn) \
+                        .set_index("company_name")["company_id"].to_dict()
+            
+            cat_map = pd.read_sql("SELECT category_id, category_name FROM dim_categories;", conn) \
+                        .set_index("category_name")["category_id"].to_dict()
 
-        # 2. Load dim_categories & capture category_id mapping
-        category_id_map = {}
-        print(f"Loading {len(df_categories)} categories into 'dim_categories'...")
-        for _, row in df_categories.iterrows():
-            result = conn.execute(
-                text("""
-                    INSERT INTO dim_categories (category_name)
-                    VALUES (:cat_name)
-                    ON CONFLICT (category_name) DO UPDATE
-                    SET category_name = EXCLUDED.category_name
-                    RETURNING category_id, category_name;
-                """),
-                {"cat_name": row["category_name"]}
-            )
-            cat_id, cat_name = result.fetchone()
-            category_id_map[cat_name] = cat_id
+            logger.info(f"Upserting {len(df_jobs)} jobs into fct_job_postings...")
+            inserted_jobs = 0
+            for _, row in df_jobs.iterrows():
+                company_id = comp_map.get(row["company_name"])
+                category_id = cat_map.get(row["category_name"])
 
-        # 3. Prepare Fact table records using mapped Foreign Keys
-        print(f"Loading {len(df_jobs)} jobs into 'fct_job_postings'...")
-        for _, row in df_jobs.iterrows():
-            c_id = company_id_map.get(row["company_name"])
-            cat_id = category_id_map.get(row["category_name"])
+                if not company_id:
+                    logger.warning(f"Skipping job ID {row['job_id']}: Company '{row['company_name']}' ID not found.")
+                    continue
 
-            pub_date = row["publication_date"]
-            pub_date_val = None if pd.isna(pub_date) else pub_date
+                conn.execute(
+                    text("""
+                        INSERT INTO fct_job_postings (
+                            source_job_id, company_id, category_id, title,
+                            publication_date, candidate_required_location, url
+                        )
+                        VALUES (
+                            :source_job_id, :company_id, :category_id, :title,
+                            :publication_date, :candidate_required_location, :url
+                        )
+                        ON CONFLICT (source_job_id) DO UPDATE SET
+                            company_id = EXCLUDED.company_id,
+                            category_id = EXCLUDED.category_id,
+                            title = EXCLUDED.title,
+                            publication_date = EXCLUDED.publication_date,
+                            candidate_required_location = EXCLUDED.candidate_required_location,
+                            url = EXCLUDED.url;
+                    """),
+                    {
+                        "source_job_id": row["job_id"],
+                        "company_id": company_id,
+                        "category_id": category_id,
+                        "title": row["title"],
+                        "publication_date": row["publication_date"],
+                        "candidate_required_location": row["candidate_required_location"],
+                        "url": row["url"]
+                    }
+                )
+                inserted_jobs += 1
 
-            conn.execute(
-                text("""
-                    INSERT INTO fct_job_postings (
-                        source_job_id, company_id, category_id, title,
-                        publication_date, candidate_required_location, url
-                    ) VALUES (
-                        :source_job_id, :company_id, :category_id, :title,
-                        :publication_date, :candidate_required_location, :url
-                    )
-                    ON CONFLICT (source_job_id) DO UPDATE SET
-                        title = EXCLUDED.title,
-                        url = EXCLUDED.url;
-                """),
-                {
-                    "source_job_id": row["job_id"],
-                    "company_id": c_id,
-                    "category_id": cat_id,
-                    "title": row["title"],
-                    "publication_date": pub_date_val,
-                    "candidate_required_location": row["candidate_required_location"],
-                    "url": row["url"]
-                    # "job_type": row["job_type"],
-                    # "salary": row["salary"],
-                }
-            )
+            logger.info(f"Successfully committed transaction! Loaded {inserted_jobs} job records to database.")
 
-    print("Successfully loaded Star Schema data into PostgreSQL!")
+    except Exception as e:
+        logger.error(f"Database transaction failed! All changes rolled back automatically. Error: {e}")
+        raise e
 
 if __name__ == "__main__":
-    raw_data = fetch_job_data()
-    df_companies, df_categories, df_jobs = transform_data(raw_data)
-    load_data_to_postgres(df_companies, df_categories, df_jobs)
+    load_data()
