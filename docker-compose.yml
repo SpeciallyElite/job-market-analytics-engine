@@ -3,6 +3,8 @@ services:
   postgres_db:
     image: postgres:16
     container_name: de_postgres_container
+    networks:
+      - etl_network
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
@@ -17,10 +19,75 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-  
+
+  airflow_db:
+    image: postgres:16
+    container_name: de_airflow_db
+    networks:
+      - etl_network
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow_password
+      POSTGRES_DB: airflow_metadata
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow_metadata"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  airflow-webserver:
+    image: apache/airflow:2.8.1-python3.11
+    container_name: de_airflow_webserver
+    restart: always
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    networks:
+      - etl_network
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow_password@airflow_db:5432/airflow_metadata
+      - AIRFLOW__WEBSERVER__SECRET_KEY=my_shared_secret_key_12345
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "airflow db init &&
+              airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin &&
+              airflow webserver"
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1-python3.11
+    container_name: de_airflow_scheduler
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      airflow-webserver:
+        condition: service_started
+    networks:
+      - etl_network
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow_password@airflow_db:5432/airflow_metadata
+      - AIRFLOW__WEBSERVER__SECRET_KEY=my_shared_secret_key_12345
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: airflow scheduler
+
+
   etl_pipeline:
     build: .
     container_name: de_python_pipeline
+    networks:
+      - etl_network
     environment:
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
@@ -33,3 +100,8 @@ services:
 
 volumes:
   postgres_data:
+  airflow_postgres_data:
+
+networks:
+  etl_network:
+    name: etl_network

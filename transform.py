@@ -71,7 +71,7 @@ def transform_data():
                         cleaned_tag = str(tag).strip().lower()
                         categories_set.add(cleaned_tag)
                         if not primary_tag:
-                            primary_tag = cleaned_tag  
+                            primary_tag = cleaned_tag
 
             fact_jobs_list.append({
                 "job_id": job_id,
